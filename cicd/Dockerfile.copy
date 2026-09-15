@@ -11,7 +11,7 @@
 #     --build-arg BIN=./bin/jetstream-controller-amd64 \
 #     -t <registry>/<repo>:<tag> .
 
-ARG ALPINE_VERSION=3.23
+ARG ALPINE_VERSION=3.24.1
 ARG BIN=jetstream-controller-amd64
 
 FROM alpine:${ALPINE_VERSION}
