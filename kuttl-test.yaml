@@ -4,4 +4,5 @@ testDirs:
   - tests/
 commands:
   - command: kubectl apply -f ./deploy/crds.yml
+  - command: kubectl apply -f ./tests/namespace-watch-rbac.yaml
 timeout: 120
