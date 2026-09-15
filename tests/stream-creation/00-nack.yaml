@@ -8,4 +8,5 @@ commands:
     ignoreFailure: true
   - command: helm repo add nats https://nats-io.github.io/k8s/helm/charts --force-update
   - command: helm upgrade --install --wait --namespace $NAMESPACE nats nats/nats -f ../nats.yaml
-  - command: helm upgrade --install --wait --namespace $NAMESPACE nack nats/nack --skip-crds -f ../nack.yaml
+  - command: kubectl create clusterrolebinding nack-e2e-$NAMESPACE --clusterrole=nack-e2e-namespace-watch --serviceaccount=$NAMESPACE:nack-e2e
+  - command: helm upgrade --install --wait --namespace $NAMESPACE nack nats/nack --skip-crds -f ../nack.yaml --set serviceAccountName=nack-e2e

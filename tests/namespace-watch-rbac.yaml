@@ -1,0 +1,10 @@
+# The fork's Stream and KeyValue controllers watch namespace role annotations.
+# The upstream namespaced Helm chart does not grant access to namespaces.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: nack-e2e-namespace-watch
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "watch"]
