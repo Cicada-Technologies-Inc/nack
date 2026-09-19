@@ -3,21 +3,29 @@
 # Minimal package-only Dockerfile for forks that cross-compile the
 # binary on the host (no Go toolchain inside the build context).
 #
+# One binary per target architecture has to be staged in the build context,
+# named jetstream-controller-<arch>. BuildKit sets TARGETARCH once per platform
+# it is building, so the same Dockerfile picks the right one.
+#
 # Build with:
-#   GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build \
-#     -tags timetzdata -o ./bin/jetstream-controller-amd64 \
-#     ./cmd/jetstream-controller
-#   docker build -f cicd/Dockerfile.copy \
-#     --build-arg BIN=./bin/jetstream-controller-amd64 \
-#     -t <registry>/<repo>:<tag> .
+#   for arch in amd64 arm64; do
+#     GOOS=linux GOARCH=$arch CGO_ENABLED=0 go build \
+#       -tags timetzdata -o ./jetstream-controller-$arch \
+#       ./cmd/jetstream-controller
+#   done
+#   docker buildx build -f cicd/Dockerfile.copy \
+#     --platform linux/amd64,linux/arm64 \
+#     -t <registry>/<repo>:<tag> --push .
 
 ARG ALPINE_VERSION=3.24.1
-ARG BIN=jetstream-controller-amd64
 
 FROM alpine:${ALPINE_VERSION}
 
-ARG BIN
-ARG TARGETPLATFORM
+# Set by BuildKit, once per platform being built.
+ARG TARGETARCH
+# The per-platform binary. Override only for a one-off build of a single
+# architecture from a differently named file.
+ARG BIN=jetstream-controller-${TARGETARCH}
 
 RUN apk add --no-cache ca-certificates && \
     addgroup -S nack && adduser -S -G nack nack

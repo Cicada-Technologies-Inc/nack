@@ -30,17 +30,21 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Cross-compile jetstream-controller (linux/amd64)
+      # One binary per architecture, straight into the build context. The
+      # Dockerfile picks by TARGETARCH, so the names matter.
+      - name: Cross-compile jetstream-controller (linux/amd64, linux/arm64)
         run: |
-          mkdir -p bin
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
-            -tags timetzdata \
-            -ldflags "-s -w \
-              -X main.Version=${{ github.ref_name }}-${GITHUB_SHA::7} \
-              -X main.GitInfo=${{ github.ref_name }}-${GITHUB_SHA::7} \
-              -X main.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%S%z)" \
-            -o bin/jetstream-controller-amd64 \
-            ./cmd/jetstream-controller
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build \
+              -tags timetzdata \
+              -ldflags "-s -w \
+                -X main.Version=${{ github.ref_name }}-${GITHUB_SHA::7} \
+                -X main.GitInfo=${{ github.ref_name }}-${GITHUB_SHA::7} \
+                -X main.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%S%z)" \
+              -o jetstream-controller-$arch \
+              ./cmd/jetstream-controller
+          done
+          file jetstream-controller-amd64 jetstream-controller-arm64
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -60,20 +64,27 @@ jobs:
             type=sha,format=short
             type=raw,value=latest,enable={{is_default_branch}}
 
+      # The Dockerfile has RUN steps (apk add, adduser, chmod), and those
+      # execute inside the target platform's container. Building linux/arm64 on
+      # an amd64 runner therefore needs binfmt emulation registered first, or
+      # the arm64 half fails with "exec format error" during the build itself.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-
-      - name: Stage binary in build context
-        run: cp bin/jetstream-controller-amd64 ./jetstream-controller-amd64
 
       - name: Build and push image
         uses: docker/build-push-action@v6
         with:
           context: .
           file: cicd/Dockerfile.copy
-          platforms: linux/amd64
-          build-args: |
-            BIN=jetstream-controller-amd64
+          # Publishing an index rather than a single-architecture image. An
+          # amd64 consumer keeps pulling exactly what it pulled before; an arm64
+          # cluster stops failing with "exec format error".
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
