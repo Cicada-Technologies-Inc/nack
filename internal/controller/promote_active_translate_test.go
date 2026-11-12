@@ -44,7 +44,7 @@ func Test_translateStreamSpecToPrimary(t *testing.T) {
 	}
 	out := translateStreamSpecToPrimary(orig)
 	assert.Nil(t, out.Mirror, "mirror must be stripped")
-	assert.Nil(t, out.Sources, "sources must be stripped")
+	assert.Equal(t, orig.Sources, out.Sources, "authored sources must be kept")
 	assert.Equal(t, []string{"s.>"}, out.Subjects, "authored subjects must be kept")
 	assert.NotNil(t, orig.Mirror, "input CR spec must be untouched (deep copy)")
 }

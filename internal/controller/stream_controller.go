@@ -18,9 +18,11 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -38,6 +40,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -213,6 +216,7 @@ func (r *StreamReconciler) createOrUpdate(ctx context.Context, log logr.Logger, 
 	// with a clear reason and the success path is skipped.
 	var passiveRoleGuardBlocked bool
 	var passiveRoleGuardMessage string
+	var retentionDeferred bool
 
 	// Evaluate passive-role translation BEFORE touching NATS so the
 	// rest of the reconcile (server state probe, mirror-flip detection,
@@ -252,14 +256,21 @@ func (r *StreamReconciler) createOrUpdate(ctx context.Context, log logr.Logger, 
 		isScopeLabeled(stream.Labels),
 		localRole,
 		r.JetStreamController.ColdStartRoleDefaultsPassive(),
-		stream.Spec.Mirror != nil,
+		stream.Spec.Mirror != nil || stream.Annotations["drp.cicada.io/sources-resume-config"] != "",
 	) {
 		// ACTIVE-role translation: the gitops "mirror baseline" CR carries both a
 		// Mirror and the authored Subjects. Strip the Mirror so the effective spec
 		// is primary form; shouldConvertActiveRole then fires and the two-phase
 		// in-place promote converges the server mirror to a primary (messages
 		// preserved, never deleted). The in-cluster CR is left untouched.
-		translated := translateStreamSpecToPrimary(&stream.Spec)
+		translated, err := activeStreamSpec(stream)
+		if err != nil {
+			stream.Status.Conditions = updateReadyCondition(stream.Status.Conditions, v1.ConditionFalse, stateErrored, err.Error())
+			if statusErr := r.Status().Update(ctx, stream); statusErr != nil {
+				log.Error(statusErr, "Failed to record active-role translation error")
+			}
+			return fmt.Errorf("active-role translation: %w", err)
+		}
 		effectiveSpec = &translated
 		log.Info("Active-role translation: stripping CR-authored mirror so the effective spec is primary form (keeping authored subjects).",
 			"localRole", localRole,
@@ -278,6 +289,52 @@ func (r *StreamReconciler) createOrUpdate(ctx context.Context, log logr.Logger, 
 		serverState, err := getServerStreamState(js, stream)
 		if err != nil {
 			return err
+		}
+
+		// Restoring interest before application consumers have resumed can
+		// discard the entire replicated backlog (including on NATS 2.15.2).
+		// Keep the existing limits policy through promotion and later resyncs.
+		// A fresh primary still gets its authored interest policy. Restoring
+		// interest on an existing DR stream requires an explicit operation once
+		// the application's actual consumer interest has been verified.
+		if serverState != nil && serverState.Retention == jsmapi.LimitsPolicy &&
+			isScopeLabeled(stream.Labels) && effectiveSpec.Retention == "interest" {
+			effectiveSpec = effectiveSpec.DeepCopy()
+			effectiveSpec.Retention = "limits"
+			retentionDeferred = true
+			log.Info("Keeping limits retention to preserve the DR backlog; restore interest only after verifying application consumer interest.", "streamName", stream.Spec.Name)
+		}
+
+		// Argo may restore a mirror baseline after the operator has promoted
+		// sources. Keep the one-shot resume hints already applied to NATS;
+		// resetting them to zero can replay the upstream's entire history.
+		if r.PassiveRoleTranslationEnabled() && isScopeLabeled(stream.Labels) &&
+			effectiveSpec.Mirror == nil && serverState != nil && serverState.Mirror == nil {
+			// A west primary baseline can also lose its spec's runtime hints.
+			// Copy even when no role translation was needed, keeping the CR intact.
+			effectiveSpec = effectiveSpec.DeepCopy()
+			for _, source := range effectiveSpec.Sources {
+				if source == nil || source.OptStartSeq != 0 || source.OptStartTime != "" {
+					continue
+				}
+				for _, current := range serverState.Sources {
+					if current == nil || current.OptStartSeq > uint64(^uint(0)>>1) {
+						continue
+					}
+					mapped, err := mapJSMStreamSource(source)
+					if err != nil {
+						return err
+					}
+					identity := *current
+					identity.OptStartSeq, identity.OptStartTime = 0, nil
+					if reflect.DeepEqual(mapped, &identity) {
+						source.OptStartSeq = int(current.OptStartSeq)
+						if current.OptStartTime != nil {
+							source.OptStartTime = current.OptStartTime.Format(time.RFC3339Nano)
+						}
+					}
+				}
+			}
 		}
 
 		// mustPromoteInPlace is set when the proactive flip block detects a
@@ -426,7 +483,8 @@ func (r *StreamReconciler) createOrUpdate(ctx context.Context, log logr.Logger, 
 		// and the live server are BOTH the mirror config (diff == ""), so this
 		// short-circuit would silently swallow the promote — the production
 		// silent-no-op bug. mustPromoteInPlace forces the update through.
-		if !mustPromoteInPlace && storedState != nil && serverState != nil && stream.Status.ObservedGeneration == stream.Generation {
+		if !mustPromoteInPlace && storedState != nil && serverState != nil && stream.Status.ObservedGeneration == stream.Generation &&
+			stream.Annotations[drpInputStateAnnotation] == streamDRPInputState(stream) {
 			diff := compareConfigState(storedState, serverState)
 
 			if diff == "" {
@@ -494,7 +552,7 @@ func (r *StreamReconciler) createOrUpdate(ctx context.Context, log logr.Logger, 
 			// point mustPromoteInPlace/serverState.Mirror is false, this block is
 			// skipped, and the ordinary single update applies the subjects. So the
 			// promote converges whether both phases run in one pass or across two.
-			if mustPromoteInPlace && serverState.Mirror != nil && targetConfigHasSubjects(effectiveSpec) {
+			if mustPromoteInPlace && serverState.Mirror != nil && (targetConfigHasSubjects(effectiveSpec) || len(effectiveSpec.Sources) > 0) {
 				log.Info("Two-phase in-place mirror→primary promote: phase 1 un-mirror (drop Mirror/Sources, no subjects yet) to avoid 10034 before adding subjects.",
 					"streamName", stream.Spec.Name,
 				)
@@ -642,6 +700,11 @@ func (r *StreamReconciler) createOrUpdate(ctx context.Context, log logr.Logger, 
 				stream.Annotations = map[string]string{}
 			}
 			stream.Annotations[stateAnnotationStream] = string(updatedState)
+			if inputState := streamDRPInputState(stream); inputState != "" {
+				stream.Annotations[drpInputStateAnnotation] = inputState
+			} else {
+				delete(stream.Annotations, drpInputStateAnnotation)
+			}
 
 			return r.Update(ctx, stream)
 		}
@@ -710,11 +773,15 @@ func (r *StreamReconciler) createOrUpdate(ctx context.Context, log logr.Logger, 
 
 	// update the observed generation and ready status
 	stream.Status.ObservedGeneration = stream.Generation
+	readyMessage := "Stream successfully created or updated."
+	if retentionDeferred {
+		readyMessage += " Effective retention remains limits to preserve the DR backlog; interest restoration is deferred until application consumer interest is verified."
+	}
 	stream.Status.Conditions = updateReadyCondition(
 		stream.Status.Conditions,
 		v1.ConditionTrue,
 		stateReady,
-		"Stream successfully created or updated.",
+		readyMessage,
 	)
 	err = r.Status().Update(ctx, stream)
 	if err != nil {
@@ -722,6 +789,46 @@ func (r *StreamReconciler) createOrUpdate(ctx context.Context, log logr.Logger, 
 	}
 
 	return nil
+}
+
+const drpInputStateAnnotation = "stream.nats.io/drp-input-state"
+
+var streamDRPAnnotationKeys = []string{
+	"drp.cicada.io/promote-subjects",
+	"drp.cicada.io/sources-config",
+	"drp.cicada.io/sources-resume-config",
+	"drp.cicada.io/promote-retention",
+}
+
+func streamDRPInputState(stream *api.Stream) string {
+	values := make([]string, len(streamDRPAnnotationKeys))
+	nonempty := false
+	for i, key := range streamDRPAnnotationKeys {
+		values[i] = stream.Annotations[key]
+		nonempty = nonempty || values[i] != ""
+	}
+	if !nonempty {
+		return ""
+	}
+	raw, _ := json.Marshal(values)
+	return fmt.Sprintf("%x", sha256.Sum256(raw))
+}
+
+func streamConfigChangedPredicate() predicate.Predicate {
+	return predicate.Funcs{UpdateFunc: func(e event.UpdateEvent) bool {
+		if e.ObjectOld == nil || e.ObjectNew == nil {
+			return false
+		}
+		if e.ObjectOld.GetGeneration() != e.ObjectNew.GetGeneration() {
+			return true
+		}
+		for _, key := range streamDRPAnnotationKeys {
+			if e.ObjectOld.GetAnnotations()[key] != e.ObjectNew.GetAnnotations()[key] {
+				return true
+			}
+		}
+		return false
+	}}
 }
 
 func getStoredStreamState(stream *api.Stream) (*jsmapi.StreamConfig, error) {
@@ -1153,14 +1260,12 @@ func mapJSMStreamSource(ss *api.StreamSource) (*jsmapi.StreamSource, error) {
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *StreamReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	// GenerationChangedPredicate is scoped to the Stream source ONLY (it was
-	// previously a global WithEventFilter). The namespace watch needs its own
-	// predicate because a local-role annotation change does NOT bump the
-	// Namespace's generation, so a global GenerationChangedPredicate would
-	// filter every namespace event out.
+	// Stream annotations contain active DR configuration, so relevant
+	// annotation-only updates must enqueue reconciliation too. Keep this
+	// predicate scoped to Streams: namespace role changes use their own watch.
 	c := mgr.GetClient()
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&api.Stream{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
+		For(&api.Stream{}, builder.WithPredicates(streamConfigChangedPredicate())).
 		Watches(
 			&v1.Namespace{},
 			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, ns client.Object) []reconcile.Request {
