@@ -8,14 +8,21 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Commit or ref to build (empty builds the workflow revision)
+        required: false
+        type: string
 
 permissions:
   contents: read
   packages: write
+  id-token: write
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository_owner }}/nack-jetstream-controller
+  DEV_ECR_REGISTRY: 916491057812.dkr.ecr.us-west-2.amazonaws.com
 
 jobs:
   build-and-push:
@@ -23,6 +30,14 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
+
+      - name: Resolve source revision
+        id: source
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -33,13 +48,15 @@ jobs:
       # One binary per architecture, straight into the build context. The
       # Dockerfile picks by TARGETARCH, so the names matter.
       - name: Cross-compile jetstream-controller (linux/amd64, linux/arm64)
+        env:
+          SOURCE_SHA: ${{ steps.source.outputs.short_sha }}
         run: |
           for arch in amd64 arm64; do
             CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build \
               -tags timetzdata \
               -ldflags "-s -w \
-                -X main.Version=${{ github.ref_name }}-${GITHUB_SHA::7} \
-                -X main.GitInfo=${{ github.ref_name }}-${GITHUB_SHA::7} \
+                -X main.Version=$SOURCE_SHA \
+                -X main.GitInfo=$SOURCE_SHA \
                 -X main.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%S%z)" \
               -o jetstream-controller-$arch \
               ./cmd/jetstream-controller
@@ -56,16 +73,29 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Configure dev AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::916491057812:role/github-actions-app-runner
+          aws-region: us-west-2
+
+      - name: Log in to dev ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
       - name: Extract image metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+            ${{ env.DEV_ECR_REGISTRY }}/nack-jetstream-controller
+          labels: |
+            org.opencontainers.image.revision=${{ steps.source.outputs.sha }}
           tags: |
-            type=ref,event=branch
-            type=ref,event=tag
-            type=sha,format=short
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch,enable=${{ github.event_name != 'workflow_dispatch' }}
+            type=ref,event=tag,enable=${{ github.event_name != 'workflow_dispatch' }}
+            type=raw,value=${{ steps.source.outputs.short_sha }},priority=1000
+            type=raw,value=latest,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       # The Dockerfile has RUN steps (apk add, adduser, chmod), and those
       # execute inside the target platform's container. Building linux/arm64 on
