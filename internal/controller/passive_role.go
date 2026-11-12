@@ -12,7 +12,9 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"reflect"
 	"strings"
 
 	api "github.com/nats-io/nack/pkg/jetstream/apis/jetstream/v1beta2"
@@ -213,6 +215,11 @@ func passiveRoleWouldDemote(serverHasMirror, effectiveSpecHasMirror bool, localR
 // transformation unconditionally on its inputs.
 func translateStreamSpecToMirror(orig *api.StreamSpec, remoteDomain string) api.StreamSpec {
 	translated := *orig.DeepCopy()
+	// An interest-retention mirror with no local consumers drops replicated
+	// messages. Keep them while passive; restore the authored policy on promote.
+	if translated.Retention == "interest" {
+		translated.Retention = "limits"
+	}
 	translated.Subjects = nil
 	translated.Sources = nil
 	streamName := orig.Name
@@ -225,8 +232,8 @@ func translateStreamSpecToMirror(orig *api.StreamSpec, remoteDomain string) api.
 }
 
 // translateStreamSpecToPrimary is the INVERSE of translateStreamSpecToMirror:
-// it returns a deep-copied spec with Mirror + Sources cleared, leaving the
-// authored Subjects intact, so the effective spec is PRIMARY form.
+// it returns a deep-copied spec with Mirror cleared, preserving the
+// authored Subjects and Sources, so the effective spec is PRIMARY form.
 //
 // Why this is needed: the DRP gitops authors the secondary region's scope
 // streams in "mirror baseline" form — the in-cluster CR carries BOTH a Mirror
@@ -242,8 +249,65 @@ func translateStreamSpecToMirror(orig *api.StreamSpec, remoteDomain string) api.
 func translateStreamSpecToPrimary(orig *api.StreamSpec) api.StreamSpec {
 	translated := *orig.DeepCopy()
 	translated.Mirror = nil
-	translated.Sources = nil
 	return translated
+}
+
+// activeStreamSpec recovers the primary configuration from a GitOps mirror
+// baseline. Sources and subject transforms must survive Argo self-healing too.
+func activeStreamSpec(stream *api.Stream) (api.StreamSpec, error) {
+	translated := translateStreamSpecToPrimary(&stream.Spec)
+	if len(translated.Subjects) == 0 {
+		for _, subject := range strings.Split(stream.Annotations["drp.cicada.io/promote-subjects"], ";") {
+			if subject = strings.TrimSpace(subject); subject != "" {
+				translated.Subjects = append(translated.Subjects, subject)
+			}
+		}
+	}
+	if len(translated.Sources) == 0 {
+		if raw := stream.Annotations["drp.cicada.io/sources-config"]; strings.TrimSpace(raw) != "" {
+			if err := json.Unmarshal([]byte(raw), &translated.Sources); err != nil {
+				return api.StreamSpec{}, fmt.Errorf("parse sources-config: %w", err)
+			}
+			for _, source := range translated.Sources {
+				if source == nil || strings.TrimSpace(source.Name) == "" {
+					return api.StreamSpec{}, fmt.Errorf("sources-config contains an empty source")
+				}
+			}
+		}
+	}
+	if raw := stream.Annotations["drp.cicada.io/sources-resume-config"]; raw != "" {
+		var hints []*api.StreamSource
+		if err := json.Unmarshal([]byte(raw), &hints); err != nil {
+			return api.StreamSpec{}, fmt.Errorf("parse sources-resume-config: %w", err)
+		}
+		for _, source := range translated.Sources {
+			if source == nil || source.OptStartSeq != 0 || source.OptStartTime != "" {
+				continue
+			}
+			for _, hint := range hints {
+				if hint == nil {
+					continue
+				}
+				identity := *hint
+				identity.OptStartSeq, identity.OptStartTime = 0, ""
+				if reflect.DeepEqual(source, &identity) {
+					source.OptStartSeq, source.OptStartTime = hint.OptStartSeq, hint.OptStartTime
+				}
+			}
+		}
+	}
+	if policy := stream.Annotations["drp.cicada.io/promote-retention"]; policy != "" {
+		switch policy {
+		case "limits", "interest", "workqueue":
+			translated.Retention = policy
+		default:
+			return api.StreamSpec{}, fmt.Errorf("invalid promote-retention %q", policy)
+		}
+	}
+	if len(translated.Subjects) == 0 && len(translated.Sources) == 0 {
+		return api.StreamSpec{}, fmt.Errorf("mirror baseline requires promote-subjects or sources-config before active-role translation")
+	}
+	return translated, nil
 }
 
 // shouldTranslateActiveRole reports whether the reconciler should strip a
