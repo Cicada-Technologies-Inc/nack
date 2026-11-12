@@ -42,7 +42,7 @@ activation, verify the physical stream survives and confirm new work arrives
 without replaying historical work.
 
 Review order is this Cicada fork, the paired drp-operator commit pin, then
-GitOps. All PRs are drafts while deployment is deferred. No server upgrade or
+GitOps. Readiness for review does not authorize merge or deployment. No server upgrade or
 feature activation is part of publishing the branches. A future rollout must
 install this NACK build before the paired operator and GitOps manifests. Existing primary-to-mirror migrations remain subject
 to the backup gate; review current snapshots and stream state before migrating.
