@@ -38,14 +38,15 @@ type Config struct {
 	// RequireBackupConfirmation gates the destructive recreate on an
 	// external backup operator confirming that local data has been
 	// captured. When true AND the local server stream has data AND the
-	// cross-region peer can NOT be reached or does NOT have enough
-	// messages, the controller sets a `BackupRequired=True` condition
-	// on the CR and requeues without destroying. An external operator
-	// (e.g. drp-operator) watches the condition, takes a backup, and
-	// records the generation it confirmed via the
-	// BackupConfirmedAnnotation. On the next reconcile, if the
-	// annotation value matches the CR's current Generation, the
-	// controller clears the condition and proceeds with the delete.
+	// cross-region peer can NOT be reached or its sequence range does
+	// NOT contain the local one, the controller records a backup demand
+	// (generation + local sequence fingerprint), sets a
+	// `BackupRequired=True` condition on the CR and requeues without
+	// destroying. An external operator (e.g. drp-operator) watches the
+	// condition, takes a backup, and confirms it via the
+	// BackupConfirmedAnnotation. The confirmation is bound to the
+	// generation and the local sequence range and is consumed before the
+	// delete, so it authorizes a single recreate (see backup_gate.go).
 	//
 	// Default false — preserves the v1 mirror-recreate behaviour.
 	RequireBackupConfirmation bool
@@ -68,9 +69,10 @@ type Config struct {
 
 	// BackupConfirmedAnnotation is the K8s annotation key the
 	// reconciler reads to know that the configured external backup
-	// operator has captured the local stream for the CR's current
-	// Generation. Value must equal the CR's `metadata.generation` (as
-	// a decimal string) to satisfy the gate. Default
+	// operator has captured the local stream. Value is either
+	// "gen=<g>,first=<f>,last=<l>,msgs=<n>" (self-verifying) or the
+	// historical "<g>" (accepted only as the answer to a recorded
+	// demand). See backup_gate.go. Default
 	// "drp.cicada.io/backup-confirmed-generation".
 	BackupConfirmedAnnotation string
 
