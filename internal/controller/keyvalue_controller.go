@@ -160,6 +160,7 @@ func (r *KeyValueReconciler) deleteKeyValue(ctx context.Context, log logr.Logger
 				return nil
 			}
 
+			log.Info("Deleting KeyValue from NATS server.", keyValueStateBeforeDelete(ctx, js, keyValue.Spec.Bucket)...)
 			return js.DeleteKeyValue(ctx, keyValue.Spec.Bucket)
 		})
 		if errors.Is(err, jetstream.ErrBucketNotFound) {
@@ -349,9 +350,11 @@ func (r *KeyValueReconciler) createOrUpdate(ctx context.Context, log logr.Logger
 					return nil
 				}
 				log.Info("Source<->mirror flip detected (primary→mirror); force-recreating KeyValue.",
-					"specHasMirror", effectiveSpec.Mirror != nil,
-					"serverHasMirror", serverState.Mirror != nil,
-					"translated", translatePassive,
+					append([]any{
+						"specHasMirror", effectiveSpec.Mirror != nil,
+						"serverHasMirror", serverState.Mirror != nil,
+						"translated", translatePassive,
+					}, keyValueStateBeforeDelete(ctx, js, keyValue.Spec.Bucket)...)...,
 				)
 				if delErr := js.DeleteKeyValue(ctx, keyValue.Spec.Bucket); delErr != nil && !errors.Is(delErr, jetstream.ErrBucketNotFound) {
 					return fmt.Errorf("force-delete on mirror flip: %w", delErr)
@@ -443,7 +446,7 @@ func (r *KeyValueReconciler) createOrUpdate(ctx context.Context, log logr.Logger
 						return nil
 					}
 					log.Info("UpdateKeyValue rejected by NATS as mirror-incompatible; force-recreating KeyValue.",
-						"err", err.Error(),
+						append([]any{"err", err.Error()}, keyValueStateBeforeDelete(ctx, js, keyValue.Spec.Bucket)...)...,
 					)
 					if delErr := js.DeleteKeyValue(ctx, keyValue.Spec.Bucket); delErr != nil && !errors.Is(delErr, jetstream.ErrBucketNotFound) {
 						return fmt.Errorf("force-delete after mirror-incompatible update: %w", delErr)
