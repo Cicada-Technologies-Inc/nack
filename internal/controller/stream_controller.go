@@ -159,6 +159,7 @@ func (r *StreamReconciler) deleteStream(ctx context.Context, log logr.Logger, st
 				return nil
 			}
 
+			log.Info("Deleting stream from NATS server.", streamStateBeforeDelete(js, stream.Spec.Name)...)
 			return js.DeleteStream(stream.Spec.Name)
 		})
 		if jsmapi.IsNatsErr(err, JSStreamNotFoundErr) {
@@ -407,9 +408,11 @@ func (r *StreamReconciler) createOrUpdate(ctx context.Context, log logr.Logger, 
 					return nil
 				}
 				log.Info("Source<->mirror flip detected (primary→mirror); force-recreating Stream.",
-					"specHasMirror", effectiveSpec.Mirror != nil,
-					"serverHasMirror", serverState.Mirror != nil,
-					"translated", translatePassive,
+					append([]any{
+						"specHasMirror", effectiveSpec.Mirror != nil,
+						"serverHasMirror", serverState.Mirror != nil,
+						"translated", translatePassive,
+					}, streamStateBeforeDelete(js, stream.Spec.Name)...)...,
 				)
 				if delErr := js.DeleteStream(stream.Spec.Name); delErr != nil && !jsmapi.IsNatsErr(delErr, JSStreamNotFoundErr) {
 					return fmt.Errorf("force-delete on mirror flip: %w", delErr)
@@ -587,7 +590,7 @@ func (r *StreamReconciler) createOrUpdate(ctx context.Context, log logr.Logger, 
 						return nil
 					}
 					log.Info("UpdateConfiguration rejected by NATS as mirror-incompatible; force-recreating Stream.",
-						"err", err.Error(),
+						append([]any{"err", err.Error()}, streamStateBeforeDelete(js, stream.Spec.Name)...)...,
 					)
 					if delErr := js.DeleteStream(stream.Spec.Name); delErr != nil && !jsmapi.IsNatsErr(delErr, JSStreamNotFoundErr) {
 						return fmt.Errorf("force-delete after mirror-incompatible update: %w", delErr)
