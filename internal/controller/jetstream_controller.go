@@ -91,9 +91,9 @@ type JetStreamController interface {
 
 	// RequireBackupConfirmation returns true when destructive recreate
 	// should be gated on an external backup operator confirming the
-	// local data via the BackupConfirmedAnnotation matching the CR's
-	// current generation. See Config.RequireBackupConfirmation for the
-	// full semantics.
+	// local data via the BackupConfirmedAnnotation, bound to the CR's
+	// current generation and the stream's sequence range (see
+	// backup_gate.go and Config.RequireBackupConfirmation).
 	RequireBackupConfirmation() bool
 
 	// CrossRegionNATSURL is the NATS URL the controller uses for the
@@ -106,8 +106,8 @@ type JetStreamController interface {
 	CrossRegionNATSCredsPath() string
 
 	// BackupConfirmedAnnotation is the annotation key the controller
-	// reads to know the external backup completed. Value must match
-	// the CR's current generation (decimal) for the gate to clear.
+	// reads to know the external backup completed. Accepted values are
+	// documented in backup_gate.go.
 	BackupConfirmedAnnotation() string
 
 	// PassiveRoleTranslationEnabled returns true when the controller
@@ -660,27 +660,12 @@ func removePassiveRoleTranslatedCondition(conditions []api.Condition) []api.Cond
 	return out
 }
 
-// backupConfirmedForGeneration reports whether the CR's
-// `metadata.annotations[<annotationKey>]` equals the decimal form of
-// the expected generation. Used as the clear-path predicate for the
-// BackupRequired gate.
-func backupConfirmedForGeneration(annotations map[string]string, annotationKey string, expectedGeneration int64) bool {
-	if annotations == nil {
-		return false
-	}
-	v, ok := annotations[annotationKey]
-	if !ok || v == "" {
-		return false
-	}
-	return v == strconv.FormatInt(expectedGeneration, 10)
-}
-
-// probeCrossRegionStreamMsgs opens a short-lived NATS connection to
+// probeCrossRegionStream opens a short-lived NATS connection to
 // `serverURL`, queries `streamName` JetStream stream info, and returns
-// the message count + a stream-not-found flag. Returns (0, false, err)
-// on any connection/auth failure so the gate can demand a backup in
-// the "can't confirm" case.
-func probeCrossRegionStreamMsgs(serverURL, credsPath, streamName string, timeout time.Duration) (msgs uint64, exists bool, err error) {
+// the peer's sequence-range fingerprint. A missing stream is reported as
+// Exists=false with a nil error; any connection/auth failure is an error
+// so the gate demands a backup in the "can't confirm" case.
+func probeCrossRegionStream(serverURL, credsPath, streamName string, timeout time.Duration) (peerCoverage, error) {
 	opts := []nats.Option{
 		nats.Name("nack-cross-region-probe"),
 		nats.Timeout(timeout),
@@ -692,24 +677,28 @@ func probeCrossRegionStreamMsgs(serverURL, credsPath, streamName string, timeout
 	}
 	nc, err := nats.Connect(serverURL, opts...)
 	if err != nil {
-		return 0, false, fmt.Errorf("connect cross-region NATS %s: %w", serverURL, err)
+		return peerCoverage{}, fmt.Errorf("connect cross-region NATS %s: %w", serverURL, err)
 	}
 	defer nc.Close()
 
 	jsCtx, err := jetstream.New(nc)
 	if err != nil {
-		return 0, false, fmt.Errorf("jetstream client: %w", err)
+		return peerCoverage{}, fmt.Errorf("jetstream client: %w", err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	info, err := jsCtx.Stream(ctx, streamName)
 	if err != nil {
 		if errors.Is(err, jetstream.ErrStreamNotFound) {
-			return 0, false, nil
+			return peerCoverage{}, nil
 		}
-		return 0, false, fmt.Errorf("stream info %s: %w", streamName, err)
+		return peerCoverage{}, fmt.Errorf("stream info %s: %w", streamName, err)
 	}
-	return info.CachedInfo().State.Msgs, true, nil
+	st := info.CachedInfo().State
+	return peerCoverage{
+		Exists:      true,
+		Fingerprint: streamFingerprint{First: st.FirstSeq, Last: st.LastSeq, Msgs: st.Msgs},
+	}, nil
 }
 
 func compareConfigState(actual any, desired any) string {
