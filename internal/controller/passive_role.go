@@ -223,12 +223,35 @@ func translateStreamSpecToMirror(orig *api.StreamSpec, remoteDomain string) api.
 	translated.Subjects = nil
 	translated.Sources = nil
 	streamName := orig.Name
+	if authoredMirrorMatches(orig.Mirror, streamName, remoteDomain) {
+		// The CR already authors this exact mirror (same origin, same peer
+		// domain). Keep it verbatim: a mirror's configuration cannot be
+		// updated in place, so swapping in the synthesized deliver prefix
+		// would turn an already-correct passive copy into a recreate.
+		return translated
+	}
 	translated.Mirror = &api.StreamSource{
 		Name:                  streamName,
 		ExternalAPIPrefix:     fmt.Sprintf("$JS.%s.API", remoteDomain),
 		ExternalDeliverPrefix: fmt.Sprintf("deliver.%s.dr", streamName),
 	}
 	return translated
+}
+
+// authoredMirrorMatches reports whether a CR-authored mirror already pulls
+// the given origin from the peer domain's JetStream API, with nothing beyond
+// the deliver prefix that passive translation would otherwise synthesize.
+// Filters, transforms, start positions or a domain/API mismatch all fall back
+// to the synthesized mirror.
+func authoredMirrorMatches(m *api.StreamSource, origin, remoteDomain string) bool {
+	if m == nil {
+		return false
+	}
+	if m.Name != origin || m.ExternalAPIPrefix != fmt.Sprintf("$JS.%s.API", remoteDomain) {
+		return false
+	}
+	return m.OptStartSeq == 0 && m.OptStartTime == "" && m.FilterSubject == "" &&
+		len(m.SubjectTransforms) == 0 && m.Consumer == nil
 }
 
 // translateStreamSpecToPrimary is the INVERSE of translateStreamSpecToMirror:
@@ -343,6 +366,9 @@ func translateKeyValueSpecToMirror(orig *api.KeyValueSpec, remoteDomain string) 
 	translated := *orig.DeepCopy()
 	translated.Sources = nil
 	bucket := orig.Bucket
+	if authoredMirrorMatches(orig.Mirror, kvStreamPrefix+bucket, remoteDomain) {
+		return translated
+	}
 	translated.Mirror = &api.StreamSource{
 		Name:                  kvStreamPrefix + bucket,
 		ExternalAPIPrefix:     fmt.Sprintf("$JS.%s.API", remoteDomain),
