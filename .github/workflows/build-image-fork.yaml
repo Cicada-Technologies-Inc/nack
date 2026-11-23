@@ -74,10 +74,11 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Configure dev AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v5
         with:
-          role-to-assume: arn:aws:iam::916491057812:role/github-actions-app-runner
+          role-to-assume: arn:aws:iam::916491057812:role/github-ecr-nack-publisher
           aws-region: us-west-2
+          allowed-account-ids: '916491057812'
 
       - name: Log in to dev ECR
         uses: aws-actions/amazon-ecr-login@v2
