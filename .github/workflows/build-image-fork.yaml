@@ -28,6 +28,9 @@ env:
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+    outputs:
+      short_sha: ${{ steps.source.outputs.short_sha }}
+      digest: ${{ steps.build.outputs.digest }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -144,3 +147,90 @@ jobs:
         run: |
           echo "Image pushed. Pull with one of:"
           echo "${{ steps.meta.outputs.tags }}"
+
+  promote-ats-prod:
+    name: Promote the tested index to ATS production
+    needs: build-and-push
+    if: >-
+      github.repository == 'Cicada-Technologies-Inc/nack' &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    environment: ats-prod
+    permissions:
+      id-token: write
+    concurrency:
+      group: nack-ats-prod-${{ github.sha }}
+      cancel-in-progress: false
+    env:
+      ECR_IMAGE: nack-jetstream-controller
+      SOURCE_TAG: ${{ needs.build-and-push.outputs.short_sha }}
+      INDEX_DIGEST: ${{ needs.build-and-push.outputs.digest }}
+    steps:
+      - uses: regclient/actions/regctl-installer@dd58ad94f76adb73d8ac1bf75ed25f01545d5b32 # v0.2.0
+        with:
+          release: v0.7.1
+      - name: Authenticate to ATS DEV
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: arn:aws:iam::916491057812:role/github-ecr-nack-ats-prod-source
+          aws-region: us-west-2
+          allowed-account-ids: '916491057812'
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: source
+      - name: Verify the index published by this build
+        id: verify
+        env:
+          SOURCE_REGISTRY: ${{ steps.source.outputs.registry }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_TAG" =~ ^[0-9a-f]{7}$ && "$SOURCE_TAG" == "${GITHUB_SHA:0:7}" ]]
+          [[ "$INDEX_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          repo="$SOURCE_REGISTRY/$ECR_IMAGE"
+          [[ "$(regctl image digest "$repo:$SOURCE_TAG")" == "$INDEX_DIGEST" ]]
+          arm64=$(regctl manifest get "$repo@$INDEX_DIGEST" --format raw-body |
+            jq -er --arg sha "$GITHUB_SHA" --arg source "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" '
+              select(.annotations["org.opencontainers.image.revision"] == $sha and
+                     .annotations["org.opencontainers.image.source"] == $source)
+              | [.manifests[] | select(.platform.os == "linux") | {arch: .platform.architecture, digest}]
+              | sort_by(.arch)
+              | select(map(.arch) == ["amd64", "arm64"])
+              | .[1].digest | select(test("^sha256:[0-9a-f]{64}$"))
+            ')
+          printf 'arm64=%s\n' "$arm64" >> "$GITHUB_OUTPUT"
+      - name: Authenticate to ATS production
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: arn:aws:iam::903539458131:role/github-ecr-nack-publisher
+          aws-region: us-west-2
+          allowed-account-ids: '903539458131'
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: target
+      - name: Copy the verified index and ARM64 tag
+        env:
+          SOURCE_REGISTRY: ${{ steps.source.outputs.registry }}
+          TARGET_REGISTRY: ${{ steps.target.outputs.registry }}
+          ARM64_DIGEST: ${{ steps.verify.outputs.arm64 }}
+        run: |
+          set -euo pipefail
+          source="$SOURCE_REGISTRY/$ECR_IMAGE"
+          target="$TARGET_REGISTRY/$ECR_IMAGE"
+
+          publish_tag() {
+            local tag="$1" digest="$2" current
+            if current=$(aws ecr describe-images --repository-name "$ECR_IMAGE" \
+              --image-ids "imageTag=$tag" --query 'imageDetails[0].imageDigest' --output text 2>&1); then
+              [[ "$current" == "$digest" ]]
+              return
+            fi
+            if [[ "$current" != *ImageNotFoundException* ]]; then
+              printf '%s\n' "$current" >&2
+              return 1
+            fi
+            regctl image copy "$source@$digest" "$target:$tag"
+            [[ "$(regctl image digest "$target:$tag")" == "$digest" ]]
+          }
+
+          publish_tag "$SOURCE_TAG" "$INDEX_DIGEST"
+          publish_tag "$SOURCE_TAG-arm64" "$ARM64_DIGEST"
+          printf 'ATS DEV and PROD share index `%s`.\n' "$INDEX_DIGEST" >> "$GITHUB_STEP_SUMMARY"
