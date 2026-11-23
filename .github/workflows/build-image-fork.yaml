@@ -18,6 +18,7 @@ permissions:
   contents: read
   packages: write
   id-token: write
+  attestations: write
 
 env:
   REGISTRY: ghcr.io
@@ -132,6 +133,15 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           annotations: ${{ steps.meta.outputs.annotations }}
           provenance: false
+
+      - name: Attest the ECR image digest
+        # GitHub binds the attestation to the workflow's SHA. A manual
+        # source_ref can select a different commit.
+        if: github.ref == 'refs/heads/main' && steps.source.outputs.sha == github.sha
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-name: ${{ env.DEV_ECR_REGISTRY }}/nack-jetstream-controller
+          subject-digest: ${{ steps.build.outputs.digest }}
 
       - name: Print pull command
         run: |
