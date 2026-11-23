@@ -33,12 +33,12 @@ jobs:
       - uses: regclient/actions/regctl-installer@dd58ad94f76adb73d8ac1bf75ed25f01545d5b32 # v0.2.0
         with:
           release: v0.7.1
-      - name: Authenticate to the source registry
+      - name: Authenticate to ATS production
         uses: aws-actions/configure-aws-credentials@v5
         with:
           role-to-assume: ${{ vars.ATS_ECR_SOURCE_ROLE_ARN }}
           aws-region: us-west-2
-          allowed-account-ids: '916491057812'
+          allowed-account-ids: '903539458131'
       - uses: aws-actions/amazon-ecr-login@v2
         id: source
       - name: Verify the exact source image and attestation
@@ -102,4 +102,4 @@ jobs:
 
           publish_tag "$TAG" "$INDEX"
           publish_tag "$TAG-arm64" "$ARM64"
-          printf 'Verified index `%s` in both registries.\n' "$INDEX" >> "$GITHUB_STEP_SUMMARY"
+          printf 'ATS and SEF production share index `%s`.\n' "$INDEX" >> "$GITHUB_STEP_SUMMARY"
