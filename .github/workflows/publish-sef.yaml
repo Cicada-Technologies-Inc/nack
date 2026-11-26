@@ -1,0 +1,105 @@
+name: Promote NACK to SEF
+
+on:
+  workflow_run:
+    workflows: [build-image-fork]
+    branches: [main]
+    types: [completed]
+
+permissions: {}
+
+concurrency:
+  group: sef-nack-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      github.event.workflow_run.path == '.github/workflows/build-image-fork.yaml'
+    runs-on: ubuntu-24.04
+    environment: sef-prod
+    permissions:
+      contents: read
+      attestations: read
+      id-token: write
+    env:
+      IMAGE_NAME: nack-jetstream-controller
+      SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
+    steps:
+      - uses: regclient/actions/regctl-installer@dd58ad94f76adb73d8ac1bf75ed25f01545d5b32 # v0.2.0
+        with:
+          release: v0.7.1
+      - name: Authenticate to ATS production
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ vars.ATS_ECR_SOURCE_ROLE_ARN }}
+          aws-region: us-west-2
+          allowed-account-ids: '903539458131'
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: source
+      - name: Verify the exact source image and attestation
+        id: release
+        env:
+          SOURCE_REGISTRY: ${{ steps.source.outputs.registry }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          tag="${SOURCE_SHA:0:7}"
+          repo="$SOURCE_REGISTRY/$IMAGE_NAME"
+          digest=$(regctl image digest "$repo:$tag")
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          manifest="$RUNNER_TEMP/nack-index.json"
+          regctl manifest get "$repo@$digest" --format raw-body > "$manifest"
+          [[ "sha256:$(sha256sum "$manifest" | cut -d' ' -f1)" == "$digest" ]]
+          gh attestation verify "$manifest" --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/build-image-fork.yaml" \
+            --source-ref refs/heads/main --source-digest "$SOURCE_SHA"
+          arm64=$(jq -er '
+            [.manifests[] | select(.platform.os == "linux") | {arch: .platform.architecture, digest}] | sort_by(.arch)
+            | select(map(.arch) == ["amd64", "arm64"])
+            | .[1].digest | select(test("^sha256:[0-9a-f]{64}$"))
+          ' "$manifest")
+          printf 'tag=%s\ndigest=%s\narm64=%s\n' "$tag" "$digest" "$arm64" >> "$GITHUB_OUTPUT"
+      - name: Authenticate to the destination registry
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ vars.SEF_ECR_ROLE_ARN }}
+          aws-region: us-west-2
+          allowed-account-ids: ${{ vars.SEF_ECR_ACCOUNT_ID }}
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: target
+      - name: Copy the attested index and verify both tags
+        env:
+          SOURCE_REGISTRY: ${{ steps.source.outputs.registry }}
+          TARGET_REGISTRY: ${{ steps.target.outputs.registry }}
+          TAG: ${{ steps.release.outputs.tag }}
+          INDEX: ${{ steps.release.outputs.digest }}
+          ARM64: ${{ steps.release.outputs.arm64 }}
+        run: |
+          set -euo pipefail
+          source="$SOURCE_REGISTRY/$IMAGE_NAME"
+          target="$TARGET_REGISTRY/$IMAGE_NAME"
+
+          publish_tag() {
+            local tag="$1" digest="$2" current
+            if current=$(aws ecr describe-images --repository-name "$IMAGE_NAME" \
+              --image-ids "imageTag=$tag" --query 'imageDetails[0].imageDigest' --output text 2>&1); then
+              [[ "$current" == "$digest" ]]
+              return
+            fi
+            if [[ "$current" != *ImageNotFoundException* ]]; then
+              printf '%s\n' "$current" >&2
+              return 1
+            fi
+            regctl image copy "$source@$digest" "$target:$tag"
+            [[ "$(regctl image digest "$target:$tag")" == "$digest" ]]
+          }
+
+          publish_tag "$TAG" "$INDEX"
+          publish_tag "$TAG-arm64" "$ARM64"
+          printf 'ATS and SEF production share index `%s`.\n' "$INDEX" >> "$GITHUB_STEP_SUMMARY"
