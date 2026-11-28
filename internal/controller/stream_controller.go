@@ -292,6 +292,10 @@ func (r *StreamReconciler) createOrUpdate(ctx context.Context, log logr.Logger, 
 			return err
 		}
 
+		if translatePassive && isScopeLabeled(stream.Labels) && stream.Spec.Mirror == nil && len(stream.Spec.Sources) == 0 {
+			preservePassiveMirrorDelivery(effectiveSpec.Mirror, serverState)
+		}
+
 		// Restoring interest before application consumers have resumed can
 		// discard the entire replicated backlog (including on NATS 2.15.2).
 		// Keep the existing limits policy through promotion and later resyncs.
@@ -1290,6 +1294,26 @@ func (r *StreamReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			MaxConcurrentReconciles: 1,
 		}).
 		Complete(r)
+}
+
+// A primary-form CR does not specify how the passive mirror should deliver.
+// Retain that setting only when every other part of the live mirror matches
+// the plain, same-origin peer mirror. NATS cannot update a mirror's delivery
+// prefix in place, and a 10055 can otherwise trigger a destructive recreate.
+func preservePassiveMirrorDelivery(desired *api.StreamSource, live *jsmapi.StreamConfig) {
+	if live == nil || live.Mirror == nil || live.Mirror.External == nil || len(live.Sources) != 0 {
+		return
+	}
+	expected := jsmapi.StreamSource{
+		Name: desired.Name,
+		External: &jsmapi.ExternalStream{
+			ApiPrefix:     desired.ExternalAPIPrefix,
+			DeliverPrefix: live.Mirror.External.DeliverPrefix,
+		},
+	}
+	if reflect.DeepEqual(live.Mirror, &expected) {
+		desired.ExternalDeliverPrefix = live.Mirror.External.DeliverPrefix
+	}
 }
 
 // streamMirrorFlipped reports whether the desired stream spec disagrees with
